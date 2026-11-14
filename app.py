@@ -1,117 +1,155 @@
-import csv
-import re
+"""Medical device candidate retrieval — research prototype, not regulatory advice."""
 from pathlib import Path
-
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
-BASE = Path(__file__).parent
-st.set_page_config(page_title='의료기기 품목 검색·성능 평가', page_icon='🩺', layout='wide')
+BASE = Path(__file__).resolve().parent
+st.set_page_config(page_title='의료기기 품목 검색 · 최종 연구용', page_icon='🩺', layout='wide')
 
 @st.cache_data
-def load_csv(name):
-    return pd.read_csv(BASE / name, dtype=str, encoding='utf-8-sig').fillna('')
+def csv_file(name):
+    return pd.read_csv(BASE/name, dtype=str, encoding='utf-8-sig').fillna('')
 
 @st.cache_resource
-def tfidf_index(texts):
-    vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(2,4), sublinear_tf=True)
-    matrix = vectorizer.fit_transform(texts)
-    return vectorizer, matrix
+def tfidf_index(documents):
+    vec = TfidfVectorizer(analyzer='char', ngram_range=(2,4), sublinear_tf=True)
+    return vec, vec.fit_transform(documents)
 
-@st.cache_resource(show_spinner='Sentence-BERT 모델을 처음 불러오는 중입니다. 시간이 걸릴 수 있습니다.')
-def sbert_index(texts):
+@st.cache_resource(show_spinner='Sentence-BERT 임베딩을 생성하는 중입니다 (첫 실행 시 다운로드 필요).')
+def sbert_index(documents):
     from sentence_transformers import SentenceTransformer
     model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
-    vectors = model.encode(list(texts), normalize_embeddings=True, show_progress_bar=False)
-    return model, vectors
+    matrix = model.encode(list(documents), normalize_embeddings=True, show_progress_bar=False)
+    return model, np.asarray(matrix)
 
-def original_parts(raw):
-    m = re.search('[가-힣]',raw)
-    return (raw[:m.start()].strip(),raw[m.start():].strip()) if m else (raw,'')
+@st.cache_data(show_spinner=False)
+def score_tfidf(query, documents):
+    vectorizer, matrix = tfidf_index(documents)
+    return cosine_similarity(vectorizer.transform([query]), matrix).ravel()
 
-def get_scores(q, method, texts):
-    if method == 'TF-IDF':
-        v,m = tfidf_index(texts)
-        return cosine_similarity(v.transform([q]),m).ravel()
-    model,m = sbert_index(texts)
-    return np.asarray(model.encode([q], normalize_embeddings=True, show_progress_bar=False) @ m.T).ravel()
+@st.cache_data(show_spinner=False)
+def score_sbert(query, documents):
+    model, matrix = sbert_index(documents)
+    q = model.encode([query], normalize_embeddings=True, show_progress_bar=False)
+    return np.asarray(q @ matrix.T).ravel()
 
-def rank(q, method, texts):
-    scores=get_scores(q,method,texts)
+def rank(query, method, documents):
+    scores = score_tfidf(query,documents) if method=='TF-IDF' else score_sbert(query,documents)
     return np.argsort(-scores), scores
 
-rows=load_csv('medical_devices_500.csv')
-required=['품목분류번호','품목명','등급','PDF 원문 추출(영문명·정의 포함)','검수상태']
-if any(c not in rows.columns for c in required):
-    st.error('DB 열 구성이 예상과 다릅니다.'); st.stop()
-texts=tuple((r['품목명']+' ')*8+r['PDF 원문 추출(영문명·정의 포함)'] for _,r in rows.iterrows())
+def parts(raw):
+    match=re.search('[가-힣]',raw)
+    return (raw[:match.start()].strip(),raw[match.start():].strip()) if match else (raw.strip(),'')
+
+def evaluate(tests, method, documents, codes):
+    results=[]
+    for _,t in tests.iterrows():
+        order,scores=rank(t['입력 설명'],method,documents)
+        picks=[codes[int(i)] for i in order[:3]]
+        expected=t['기대 품목분류번호']
+        results.append({'번호':t['번호'],'입력 설명':t['입력 설명'],'기대 품목코드':expected,'1위 코드':picks[0], '상위 3개 코드':' / '.join(picks), 'Top-1 일치':int(expected==picks[0]),'Top-3 포함':int(expected in picks),'1위 유사도':round(float(scores[order[0]]),4)})
+    return pd.DataFrame(results)
+
+def download_csv(label, data, filename):
+    st.download_button(label, data.to_csv(index=False).encode('utf-8-sig'), file_name=filename, mime='text/csv')
+
+rows=csv_file('medical_devices_500.csv')
+expected_cols=['품목분류번호','품목명','등급','PDF 원문 추출(영문명·정의 포함)','검수상태']
+if list(rows.columns)!=expected_cols:
+    st.error('DB의 원래 5개 열 구성이 달라졌습니다.'); st.stop()
+if len(rows)!=500 or rows['품목분류번호'].duplicated().any():
+    st.error('DB 행 수 또는 품목코드 중복을 확인해 주세요.'); st.stop()
+texts=tuple(((r['품목명']+' ')*8+r['PDF 원문 추출(영문명·정의 포함)']).strip() for _,r in rows.iterrows())
 codes=rows['품목분류번호'].tolist()
+code_set=set(codes)
+tests=csv_file('평가문항_30개.csv')
+if not set(tests['기대 품목분류번호']).issubset(code_set):
+    st.error('평가 문항 중 DB에 없는 기대 품목코드가 있습니다.'); st.stop()
 
-st.title('🩺 의료기기 품목 검색 및 검색 성능 평가')
-st.caption(f'식약처 [별표 1] PDF에서 구성한 {len(rows)}개 1·2등급 품목 · 캡스톤 연구용')
-st.warning('유사도는 품목 분류 확률이 아닙니다. 이 웹사이트는 법적 품목·등급 판정 도구가 아닙니다.')
-
-method=st.radio('검색 방식', ['TF-IDF','Sentence-BERT'], horizontal=True, help='Sentence-BERT는 첫 실행 시 모델 다운로드가 필요하며 시간이 걸릴 수 있습니다.')
-tab1,tab2,tab3=st.tabs(['🔎 의료기기 검색','📊 검색 성능 평가','📋 전체 DB'])
-with tab1:
-    query=st.text_area('사용목적·작동원리·사용부위를 설명해 주세요',value='귀에 넣어 적외선으로 체온을 측정하는 기기',height=105)
-    # Thresholds are exploratory, not validated probability cutoffs.
-    threshold=st.slider('낮은 유사도 경고 기준 (실험용)',0.0,1.0,0.12 if method=='TF-IDF' else 0.35,0.01)
-    if st.button('유사 품목 검색',type='primary'):
-        if len(query.strip())<5:st.error('5글자 이상 입력해 주세요.')
+st.title('🩺 의료기기 품목 유사도 검색 · 성능 평가')
+st.caption('식약처 [별표 1] 추출 기반 1·2등급 500개 품목 · 캡스톤 연구용 프로토타입')
+st.warning('검색 결과는 품목 후보일 뿐 법적 분류 판정이 아닙니다. 유사도 수치는 분류 확률이 아닙니다. DB 밖의 품목이나 3·4등급 의료기기는 적절히 검색되지 않을 수 있습니다.')
+method=st.radio('검색 방식', ['TF-IDF','Sentence-BERT'], horizontal=True)
+search_tab,eval_tab,errors_tab,db_tab=st.tabs(['🔎 품목 검색','📊 동일 문항 모델 비교','🧪 DB 외 입력 점검','📋 원본 DB'])
+with search_tab:
+    query=st.text_area('기기의 사용목적·작동원리·사용부위를 설명해 주세요',value='귀에 넣어 적외선으로 체온을 측정하는 기기',height=90)
+    st.caption('경고 기준은 검증된 의료기기 분류 임계값이 아닙니다. 모델별 유사도 분포가 달라 기준을 공유할 수 없습니다.')
+    cutoff=st.slider('검색 후보 표시 최소 유사도 (실험용)',0.0,1.0,0.12 if method=='TF-IDF' else 0.35,0.01,key=f'cutoff_{method}')
+    if st.button('검색 실행',type='primary'):
+        if len(query.strip())<5:
+            st.error('5글자 이상 입력해 주세요.')
         else:
             try:
                 order,scores=rank(query.strip(),method,texts)
-                top=float(scores[order[0]])
-                if top<threshold:
-                    st.error('일치하는 품목을 찾기 어렵습니다. 아래 후보는 관련성이 낮을 수 있으므로 분류에 사용하지 마세요.')
+                selected=[int(i) for i in order[:3] if float(scores[i])>=cutoff]
+                if not selected:
+                    st.error('설정한 기준을 넘는 후보가 없습니다. 결과를 억지로 추천하지 않습니다. DB에 품목이 없다는 확정 판정은 아닙니다.')
                 else:
-                    st.info('아래는 텍스트상 가까운 후보입니다. DB에 정확한 품목이 없더라도 후보가 표시될 수 있습니다.')
-                for pos,idx in enumerate(order[:3],1):
-                    r=rows.iloc[int(idx)];eng,definition=original_parts(r['PDF 원문 추출(영문명·정의 포함)'])
-                    with st.container(border=True):
-                        st.markdown(f"**{pos}위 · {r['품목명']}**")
-                        st.write(f"품목코드: {r['품목분류번호']} · 등급: {r['등급']}등급 · 검수상태: {r['검수상태']}")
-                        st.progress(float(np.clip(scores[idx],0,1)),text=f'{method} 유사도: {scores[idx]:.3f}')
-                        st.write(f'영문명: {eng or "—"}')
-                        st.write(f'한국어 정의: {definition or "원문 확인 필요"}')
-            except Exception as e:
-                st.error(f'검색 모델 실행에 실패했습니다: {e}')
-                st.info('Sentence-BERT 모델 다운로드가 실패하면 TF-IDF를 선택해 주세요.')
-with tab2:
-    st.subheader('정답 후보 30문항 평가')
-    st.caption('문항·기대 코드가 포함된 평가용 자료입니다. 기대 코드는 연구자가 가정한 것으로 전문가 검증 전이며 실제 규제상 정답을 보장하지 않습니다.')
-    tests=load_csv('평가문항_30개.csv')
-    if st.button('현재 선택한 검색 방식 평가 실행'):
+                    if len(selected)<3: st.info(f'기준 이상인 후보 {len(selected)}개만 표시합니다. 낮은 점수의 후보는 숨겼습니다.')
+                    else: st.info('상위 3개 후보입니다. 실제 품목 적합성은 정의와 규정을 대조해 확인하세요.')
+                    for pos,i in enumerate(selected,1):
+                        r=rows.iloc[i];eng,definition=parts(r['PDF 원문 추출(영문명·정의 포함)'])
+                        with st.container(border=True):
+                            st.subheader(f'{pos}위 · {r["품목명"]}')
+                            st.write(f'품목분류번호: {r["품목분류번호"]}  |  등급: {r["등급"]}등급  |  DB 검수상태: {r["검수상태"]}')
+                            st.metric('텍스트 유사도 (분류 확률 아님)',f'{float(scores[i]):.3f}')
+                            st.write('영문명:',eng or '—')
+                            st.write('한국어 정의:',definition or 'PDF 원문 확인 필요')
+            except Exception as exc:
+                st.error(f'모델 실행 실패: {exc}')
+                st.info('Sentence-BERT의 첫 실행에는 인터넷과 모델 다운로드가 필요합니다. 실패 시 TF-IDF로 전환하세요.')
+with eval_tab:
+    st.write('**동일한 30개 입력과 동일한 기대 품목코드**를 기준으로 두 방법의 Top-1·Top-3 결과를 비교합니다.')
+    st.caption('기대 품목코드는 연구자가 설정한 잠정 정답이며 전문가가 검증한 정답표가 아닙니다. 따라서 지표는 최종 규제 분류 정확도가 아닙니다.')
+    st.write(f'평가 문항 {len(tests)}개 / DB 내 기대 품목 {tests["기대 품목분류번호"].isin(code_set).sum()}개')
+    if st.button('TF-IDF · Sentence-BERT 둘 다 평가 실행',type='primary'):
         try:
-            details=[]
-            for _,t in tests.iterrows():
-                order,scores=rank(t['입력 설명'],method,texts)
-                topcodes=[codes[int(i)] for i in order[:3]]
-                details.append({'번호':t['번호'],'입력 설명':t['입력 설명'],'기대 품목코드':t['기대 품목분류번호'],'1위 품목코드':topcodes[0],'상위 3개 코드':', '.join(topcodes),'Top-1 정답':int(topcodes[0]==t['기대 품목분류번호']),'Top-3 정답':int(t['기대 품목분류번호'] in topcodes),'1위 유사도':round(float(scores[order[0]]),3)})
-            result=pd.DataFrame(details)
-            a,b,c=st.columns(3)
-            a.metric('평가 문항',len(result));b.metric('Top-1 정확도',f"{result['Top-1 정답'].mean():.1%}");c.metric('Top-3 포함률',f"{result['Top-3 정답'].mean():.1%}")
+            with st.spinner('두 검색 방식의 30문항을 평가하고 있습니다.'):
+                a=evaluate(tests,'TF-IDF',texts,codes)
+                b=evaluate(tests,'Sentence-BERT',texts,codes)
+            summary=pd.DataFrame([{'모델':'TF-IDF','Top-1 일치율':a['Top-1 일치'].mean(),'Top-3 포함률':a['Top-3 포함'].mean()}, {'모델':'Sentence-BERT','Top-1 일치율':b['Top-1 일치'].mean(),'Top-3 포함률':b['Top-3 포함'].mean()}])
+            st.dataframe(summary.style.format({'Top-1 일치율':'{:.1%}','Top-3 포함률':'{:.1%}'}),hide_index=True,use_container_width=True)
+            st.bar_chart(summary.set_index('모델')[['Top-1 일치율','Top-3 포함률']])
+            detail=a.merge(b,on=['번호','입력 설명','기대 품목코드'],suffixes=('_TFIDF','_SBERT'))
+            st.subheader('문항별 결과 및 오류 분석')
+            st.dataframe(detail,use_container_width=True,hide_index=True)
+            download_csv('두 모델 비교 결과 다운로드',detail,'모델비교_30문항_상세.csv')
+            download_csv('두 모델 요약 다운로드',summary,'모델비교_30문항_요약.csv')
+        except Exception as exc:
+            st.error(f'비교 평가 실행 실패: {exc}')
+            st.info('Sentence-BERT 실행 환경과 모델 다운로드 상태를 확인하세요. TF-IDF 단독 평가는 아래 버튼으로 실행할 수 있습니다.')
+    if st.button('TF-IDF 단독 평가'):
+        a=evaluate(tests,'TF-IDF',texts,codes)
+        c1,c2=st.columns(2)
+        c1.metric('Top-1 일치율',f'{a["Top-1 일치"].mean():.1%}')
+        c2.metric('Top-3 포함률',f'{a["Top-3 포함"].mean():.1%}')
+        st.dataframe(a,use_container_width=True,hide_index=True)
+        download_csv('TF-IDF 결과 다운로드',a,'TFIDF_30문항_평가.csv')
+    with st.expander('평가 문항과 잠정 기대 품목코드 확인'):
+        st.dataframe(tests,use_container_width=True,hide_index=True)
+with errors_tab:
+    st.write('**DB 밖 입력 5문항**의 검색 점수를 살펴보고, 관련성이 낮은 경우 후보 표시를 제한하는지 확인합니다.')
+    st.caption('이 5문항이 실제로 DB에 없는지 검증된 정답표는 없습니다. 임계값은 실험용이며, DB 외 판별 정확도·재현율을 주장할 수 없습니다.')
+    out=csv_file('DB외_시험문항_5개.csv')
+    if st.button('DB 외 사례 5개 시험'):
+        try:
+            vals=[]
+            cutoff=0.12 if method=='TF-IDF' else 0.35
+            for _,r in out.iterrows():
+                order,scores=rank(r['입력 설명'],method,texts)
+                top=int(order[0]); score=float(scores[top])
+                vals.append({'입력 설명':r['입력 설명'],'추천 1위':rows.iloc[top]['품목명'],'최상위 유사도':round(score,4),'실험 기준':cutoff,'표시 여부':'후보 보류' if score<cutoff else '후보 표시'})
+            result=pd.DataFrame(vals)
             st.dataframe(result,use_container_width=True,hide_index=True)
-            st.download_button('평가 결과 CSV 다운로드',result.to_csv(index=False).encode('utf-8-sig'),file_name=f'evaluation_{method}.csv',mime='text/csv')
-            st.info('Top-1: 기대 품목이 첫 번째 결과인지. Top-3: 기대 품목이 상위 세 결과에 있는지. 동일한 30문항으로 두 모델을 각각 실행해 비교하세요.')
-        except Exception as e:st.error(f'평가 실행 실패: {e}')
-    st.divider()
-    st.subheader('DB 외 입력 사례 5문항')
-    st.caption('실제로 DB에 없는 품목인지 별도 검증이 필요하며, 낮은 유사도만으로 DB 외 품목을 확정할 수 없습니다.')
-    ood=load_csv('DB외_시험문항_5개.csv')
-    if st.button('DB 외 입력 탐색 실행'):
-        try:
-            out=[]
-            for _,t in ood.iterrows():
-                order,scores=rank(t['입력 설명'],method,texts)
-                out.append({'입력 설명':t['입력 설명'],'최상위 추천':rows.iloc[int(order[0])]['품목명'],'최상위 유사도':round(float(scores[order[0]]),3),'실험 기준 이하':bool(scores[order[0]] < (0.12 if method=='TF-IDF' else 0.35))})
-            st.dataframe(pd.DataFrame(out),use_container_width=True,hide_index=True)
-        except Exception as e:st.error(f'실행 실패: {e}')
-with tab3:
+            download_csv('DB 외 입력 결과 다운로드',result,'DB외_5문항_시험결과.csv')
+        except Exception as exc:st.error(f'시험 실행 실패: {exc}')
+with db_tab:
+    st.write('원본 500개 DB는 **기존 5개 열을 변경하지 않고** 그대로 사용합니다.')
     st.dataframe(rows,use_container_width=True,hide_index=True)
+    download_csv('원본 DB 다운로드',rows,'medical_devices_500.csv')
 st.divider()
-st.caption('검색 방식: TF-IDF 문자 n-gram / Sentence-BERT 다국어 문장 임베딩. 모델·평가 정답 및 경고 기준은 추가 검증이 필요합니다.')
+st.caption('모델 비교와 경고 기능은 연구·실험용입니다. 최종발표 전에 정답 라벨의 전문가 검토, 외부 테스트 세트, 모델 실행 환경 검증이 필요합니다.')
